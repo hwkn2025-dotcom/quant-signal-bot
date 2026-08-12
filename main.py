@@ -10,7 +10,7 @@ import numpy as np
 
 
 # =========================
-# 你的策略設定
+# 策略設定
 # =========================
 
 TECH = [
@@ -56,7 +56,8 @@ def clamp(x, low, high):
 
 
 def fmt_money(x):
-    return f"${x:,.2f}"
+    sign = "-" if x < 0 else ""
+    return f"{sign}${abs(x):,.2f}"
 
 
 def fmt_pct(x):
@@ -130,7 +131,7 @@ def fetch_alpaca_daily_bars(symbols):
 
         if response.status_code == 401:
             raise RuntimeError(
-                "Alpaca 401 授權失敗：請重新確認 ALPACA_API_KEY / ALPACA_API_SECRET 是否正確、有沒有貼反、是否用 Paper Trading API Key。"
+                "Alpaca 401 授權失敗：請確認 ALPACA_API_KEY / ALPACA_API_SECRET 是否正確、有沒有貼反、是否用 Paper Trading API Key。"
             )
 
         if response.status_code != 200:
@@ -184,7 +185,7 @@ def fetch_alpaca_daily_bars(symbols):
 
 
 # =========================
-# 市況判斷
+# 策略邏輯
 # =========================
 
 def market_regime(close):
@@ -220,10 +221,6 @@ def market_regime(close):
 
     return "neutral", ["未達牛市條件，也未觸發熊市條件"]
 
-
-# =========================
-# 評分
-# =========================
 
 def score_candidates(close, candidates):
     strong_scores = {}
@@ -265,15 +262,16 @@ def score_candidates(close, candidates):
         if not np.isfinite(score):
             continue
 
-        row = {
+        all_scores[t] = {
             "score": float(score),
             "price": float(p_now)
         }
 
-        all_scores[t] = row
-
         if score > STRONG:
-            strong_scores[t] = row
+            strong_scores[t] = {
+                "score": float(score),
+                "price": float(p_now)
+            }
 
     return strong_scores, all_scores
 
@@ -398,10 +396,6 @@ def volatility_scale(close):
     return clamp(avg_vol / current_vol, 0.5, 1.0)
 
 
-# =========================
-# 計算策略配置
-# =========================
-
 def compute_target_weights(close):
     regime, reasons = market_regime(close)
     vol_scale = volatility_scale(close)
@@ -493,7 +487,7 @@ def compute_target_weights(close):
 
 
 # =========================
-# 狀態保存
+# 虛擬投資組合追蹤
 # =========================
 
 def load_state():
@@ -513,6 +507,68 @@ def save_state(state):
     )
 
 
+def is_valid_state(state):
+    return (
+        isinstance(state, dict)
+        and "holdings" in state
+        and "cash" in state
+        and "last_value" in state
+        and "last_date" in state
+        and "initial_cash" in state
+    )
+
+
+def latest_price(close, ticker):
+    if ticker not in close.columns:
+        raise RuntimeError(f"缺少價格資料：{ticker}")
+
+    s = close[ticker].dropna()
+
+    if len(s) == 0:
+        raise RuntimeError(f"沒有可用價格：{ticker}")
+
+    return float(s.iloc[-1])
+
+
+def prev_price(close, ticker):
+    if ticker not in close.columns:
+        return None
+
+    s = close[ticker].dropna()
+
+    if len(s) < 2:
+        return None
+
+    return float(s.iloc[-2])
+
+
+def build_positions_from_weights(target_weights, total_value, close):
+    holdings = {}
+    invested = 0.0
+
+    for ticker, weight in target_weights.items():
+        price = latest_price(close, ticker)
+        amount = total_value * weight
+        shares = amount / price
+
+        holdings[ticker] = shares
+        invested += amount
+
+    cash = total_value - invested
+
+    return holdings, cash
+
+
+def portfolio_value(holdings, cash, close):
+    total = float(cash)
+
+    for ticker, shares in holdings.items():
+        price = latest_price(close, ticker)
+        total += float(shares) * price
+
+    return total
+
+
 def max_weight_change(new_weights, old_weights):
     keys = set(new_weights.keys()) | set(old_weights.keys())
 
@@ -525,188 +581,156 @@ def max_weight_change(new_weights, old_weights):
     )
 
 
-# =========================
-# 報告工具
-# =========================
-
-def add_cash_if_needed(weights):
-    result = dict(weights)
-    total_weight = sum(result.values())
-
-    if total_weight < 0.999999:
-        result["CASH"] = 1.0 - total_weight
-
-    return result
-
-
-def get_latest_and_prev_price(close, ticker):
-    if ticker == "CASH":
-        return None, None
-
-    if ticker not in close.columns:
-        return None, None
-
-    s = close[ticker].dropna()
-
-    if len(s) < 2:
-        return None, None
-
-    return float(s.iloc[-1]), float(s.iloc[-2])
-
-
-def format_report(
-    close,
-    effective_weights,
-    details,
-    total_cash,
-    max_diff,
-    action_text
-):
-    latest_date = close.index[-1]
-
-    display_weights = add_cash_if_needed(effective_weights)
-
-    exposure = sum(
-        w for t, w in effective_weights.items()
-        if t != "CASH"
-    )
-
+def build_position_rows(holdings, cash, close, total_value, include_daily_pl):
     rows = []
-    portfolio_pl = 0.0
 
-    sorted_items = sorted(
-        display_weights.items(),
-        key=lambda x: x[1],
-        reverse=True
-    )
+    for ticker, shares in holdings.items():
+        price = latest_price(close, ticker)
+        value = shares * price
+        weight = value / total_value if total_value != 0 else 0
 
-    for ticker, weight in sorted_items:
-        amount = total_cash * weight
+        p_prev = prev_price(close, ticker)
 
-        if ticker == "CASH":
-            rows.append({
-                "ticker": ticker,
-                "weight": weight,
-                "amount": amount,
-                "shares": None,
-                "daily_pl": 0.0,
-                "daily_ret": 0.0,
-                "price": None,
-                "note": "現金"
-            })
-            continue
-
-        latest_price, prev_price = get_latest_and_prev_price(close, ticker)
-
-        if latest_price is None or prev_price is None:
-            rows.append({
-                "ticker": ticker,
-                "weight": weight,
-                "amount": amount,
-                "shares": None,
-                "daily_pl": 0.0,
-                "daily_ret": 0.0,
-                "price": None,
-                "note": "無價格資料"
-            })
-            continue
-
-        shares = amount / latest_price
-        daily_ret = latest_price / prev_price - 1
-        daily_pl = amount * daily_ret
-
-        portfolio_pl += daily_pl
+        if include_daily_pl and p_prev is not None:
+            daily_pl = shares * (price - p_prev)
+            daily_ret = price / p_prev - 1
+        else:
+            daily_pl = None
+            daily_ret = None
 
         rows.append({
             "ticker": ticker,
-            "weight": weight,
-            "amount": amount,
             "shares": shares,
+            "price": price,
+            "value": value,
+            "weight": weight,
             "daily_pl": daily_pl,
-            "daily_ret": daily_ret,
-            "price": latest_price,
-            "note": ""
+            "daily_ret": daily_ret
         })
 
-    portfolio_ret = portfolio_pl / total_cash if total_cash > 0 else 0
-    estimated_value = total_cash + portfolio_pl
+    if abs(cash) > 0.01:
+        rows.append({
+            "ticker": "CASH" if cash >= 0 else "MARGIN",
+            "shares": None,
+            "price": None,
+            "value": cash,
+            "weight": cash / total_value if total_value != 0 else 0,
+            "daily_pl": 0.0 if include_daily_pl else None,
+            "daily_ret": 0.0 if include_daily_pl else None
+        })
 
-    if "初始化" in action_text:
-        trade_status = "✅ 第一次建立配置"
-    elif "觸發換倉" in action_text:
-        trade_status = "✅ 需要換倉"
+    rows = sorted(rows, key=lambda x: x["value"], reverse=True)
+
+    return rows
+
+
+def regime_text(regime):
+    r = regime.upper()
+
+    if r == "BULL":
+        return "BULL 牛市"
+
+    if r == "NEUTRAL":
+        return "NEUTRAL 中性"
+
+    return "BEAR 熊市"
+
+
+def format_report(
+    latest_date,
+    details,
+    action_text,
+    initial_cash,
+    previous_value,
+    current_value,
+    daily_pl,
+    cumulative_pl,
+    max_diff,
+    rows,
+    include_daily_pl,
+    note
+):
+    cumulative_ret = cumulative_pl / initial_cash if initial_cash else 0
+
+    if daily_pl is None or previous_value is None:
+        daily_line = "今日 P/L：首次建立 / 同日重跑，不計算"
     else:
-        trade_status = "⏸️ 不需要換倉"
+        daily_ret = daily_pl / previous_value if previous_value else 0
+        sign = "+" if daily_pl >= 0 else ""
+        daily_line = f"今日 P/L：{sign}{fmt_money(daily_pl)} ({fmt_pct(daily_ret)})"
 
-    regime = details["regime"].upper()
+    cum_sign = "+" if cumulative_pl >= 0 else ""
 
-    if regime == "BULL":
-        regime_text = "BULL 牛市"
-    elif regime == "NEUTRAL":
-        regime_text = "NEUTRAL 中性"
-    else:
-        regime_text = "BEAR 熊市"
-
-    reason_text = "、".join(details.get("reasons", []))
-
-    sign = "+" if portfolio_pl >= 0 else ""
+    exposure = sum(
+        row["weight"]
+        for row in rows
+        if row["ticker"] not in ["CASH"]
+    )
 
     lines = []
 
-    lines.append(f"📊 策略報告｜{latest_date}")
+    lines.append(f"📊 策略追蹤報告｜{latest_date}")
     lines.append("")
-    lines.append(f"📌 市況：{regime_text}")
-    lines.append(f"🔔 換倉：{trade_status}")
-    lines.append(f"🧠 原因：{reason_text}")
+    lines.append(f"📌 市況：{regime_text(details['regime'])}")
+    lines.append(f"🔔 狀態：{action_text}")
+    lines.append(f"🧠 原因：{'、'.join(details.get('reasons', []))}")
     lines.append("")
-    lines.append(f"💰 設定總資金：{fmt_money(total_cash)}")
-    lines.append(f"📦 總曝險：{fmt_pct(exposure)}")
-    lines.append(f"📈 今日組合 P/L：{sign}{fmt_money(portfolio_pl)} ({fmt_pct(portfolio_ret)})")
-    lines.append(f"💼 今日估算資金：{fmt_money(estimated_value)}")
+    lines.append(f"💰 初始資金：{fmt_money(initial_cash)}")
+    lines.append(f"💼 目前組合價值：{fmt_money(current_value)}")
+    lines.append(f"📈 {daily_line}")
+    lines.append(f"📊 累積 P/L：{cum_sign}{fmt_money(cumulative_pl)} ({fmt_pct(cumulative_ret)})")
     lines.append("")
+    lines.append(f"📦 目前曝險：約 {fmt_pct(exposure)}")
     lines.append(f"⚙️ 波動縮放：{details['vol_scale']:.2f}")
     lines.append(f"📏 最大權重變化：{fmt_pct(max_diff)}")
     lines.append("")
 
-    if exposure > 1.0001:
-        lines.append("⚠️ 注意：目前曝險超過 100%，代表策略有使用超額曝險。")
+    if note:
+        lines.append(f"⚠️ {note}")
         lines.append("")
 
     lines.append("━━━━━━━━━━━━━━")
-    lines.append("📌 應持有配置")
+
+    if include_daily_pl:
+        lines.append("📌 目前持倉與今日損益")
+    else:
+        lines.append("📌 目前建立 / 新建立持倉")
+        lines.append("今日不計算單檔 P/L，從下一個交易日開始追蹤。")
+
     lines.append("")
 
-    for idx, row in enumerate(rows, start=1):
+    for i, row in enumerate(rows, start=1):
         ticker = row["ticker"]
-        weight = row["weight"]
-        amount = row["amount"]
-        shares = row["shares"]
-        daily_pl = row["daily_pl"]
-        daily_ret = row["daily_ret"]
-        price = row["price"]
-        note = row["note"]
 
-        lines.append(f"{idx}. {ticker}")
-        lines.append(f"比例：{fmt_pct(weight)}")
-        lines.append(f"金額：{fmt_money(amount)}")
+        lines.append(f"{i}. {ticker}")
+        lines.append(f"比例：{fmt_pct(row['weight'])}")
+        lines.append(f"金額：{fmt_money(row['value'])}")
 
-        if ticker == "CASH":
+        if ticker in ["CASH", "MARGIN"]:
             lines.append("股數：-")
-            lines.append("今日：$0.00")
-        elif shares is None:
-            lines.append("股數：無法計算")
-            lines.append(f"今日：{note}")
+            lines.append("價格：-")
         else:
-            pl_sign = "+" if daily_pl >= 0 else ""
-            lines.append(f"股數：{shares:.4f} 股")
-            lines.append(f"價格：{fmt_money(price)}")
-            lines.append(f"今日：{pl_sign}{fmt_money(daily_pl)} ({fmt_pct(daily_ret)})")
+            lines.append(f"股數：{row['shares']:.4f} 股")
+            lines.append(f"價格：{fmt_money(row['price'])}")
+
+        if include_daily_pl:
+            dpl = row["daily_pl"]
+            dret = row["daily_ret"]
+
+            if dpl is None:
+                lines.append("今日：無法計算")
+            else:
+                sign = "+" if dpl >= 0 else ""
+                lines.append(f"今日：{sign}{fmt_money(dpl)} ({fmt_pct(dret)})")
+        else:
+            lines.append("今日：從下一個交易日開始計算")
 
         lines.append("")
 
     lines.append("━━━━━━━━━━━━━━")
     lines.append("註：本系統只通知，不會自動下單。")
-    lines.append("註：P/L 是依照策略配置與最新收盤價估算。")
+    lines.append("註：這是虛擬策略追蹤，不是 Alpaca 真實成交損益。")
+    lines.append("註：第一次建立配置不算 P/L；之後每天用已建立股數追蹤每日與累積損益。")
 
     return "\n".join(lines)
 
@@ -718,66 +742,231 @@ def format_report(
 def main():
     bot_token = get_env("TELEGRAM_BOT_TOKEN")
     chat_id = get_env("TELEGRAM_CHAT_ID")
-    total_cash = float(get_env("TOTAL_CASH", required=False, default="10000"))
+
+    configured_cash = float(
+        get_env("TOTAL_CASH", required=False, default="10000")
+    )
 
     close = fetch_alpaca_daily_bars(ALL_SYMBOLS)
+    latest_date_obj = close.index[-1]
+    latest_date = str(latest_date_obj)
+    current_month = latest_date[:7]
 
     target_weights, details = compute_target_weights(close)
 
     state = load_state()
-    old_weights = state.get("weights", {})
 
-    first_run = len(old_weights) == 0
+    # 如果 state.json 是舊版本，會自動重新建立
+    if not is_valid_state(state):
+        holdings, cash = build_positions_from_weights(
+            target_weights,
+            configured_cash,
+            close
+        )
 
-    latest_date = close.index[-1]
-    current_month = str(latest_date)[:7]
-    last_checked_month = state.get("last_checked_month")
+        current_value = portfolio_value(holdings, cash, close)
 
-    is_monthly_check = first_run or (last_checked_month != current_month)
-
-    if first_run:
-        max_diff = 1.0
-    else:
-        max_diff = max_weight_change(target_weights, old_weights)
-
-    trade_action = first_run or (is_monthly_check and max_diff >= CHANGE_THRESH)
-
-    if trade_action:
-        effective_weights = target_weights
-
-        if first_run:
-            action_text = "初始化：建立第一份策略配置"
-        else:
-            action_text = "觸發換倉：本月檢查且最大權重變動達門檻"
-    else:
-        effective_weights = old_weights if old_weights else target_weights
-
-        if not is_monthly_check:
-            action_text = "非本月第一次檢查：不換倉，只回報每日 P/L"
-        else:
-            action_text = "本月檢查：最大權重變動未達 20%，不換倉"
-
-    if is_monthly_check:
         state = {
-            "weights": effective_weights,
+            "initial_cash": configured_cash,
+            "start_date": latest_date,
+            "last_date": latest_date,
+            "last_value": current_value,
+            "holdings": holdings,
+            "cash": cash,
+            "target_weights": target_weights,
             "last_checked_month": current_month,
-            "updated_at_utc": datetime.now(timezone.utc).isoformat(),
-            "regime": details["regime"]
+            "last_rebalance_month": current_month,
+            "updated_at_utc": datetime.now(timezone.utc).isoformat()
         }
+
         save_state(state)
 
-    message = format_report(
+        rows = build_position_rows(
+            holdings=holdings,
+            cash=cash,
+            close=close,
+            total_value=current_value,
+            include_daily_pl=False
+        )
+
+        message = format_report(
+            latest_date=latest_date,
+            details=details,
+            action_text="✅ 第一次建立配置，今天不計算 P/L",
+            initial_cash=configured_cash,
+            previous_value=None,
+            current_value=current_value,
+            daily_pl=None,
+            cumulative_pl=0.0,
+            max_diff=1.0,
+            rows=rows,
+            include_daily_pl=False,
+            note="這是第一天建立虛擬持倉。明天開始才會用今天建立的股數計算每日與累積 P/L。"
+        )
+
+        send_telegram(bot_token, chat_id, message)
+        print("First portfolio created.")
+        return
+
+    initial_cash = float(state["initial_cash"])
+    old_holdings = {
+        k: float(v)
+        for k, v in state["holdings"].items()
+    }
+    old_cash = float(state["cash"])
+    old_last_value = float(state["last_value"])
+    old_last_date = str(state["last_date"])
+    old_target_weights = state.get("target_weights", {})
+
+    current_value_before_rebalance = portfolio_value(
+        old_holdings,
+        old_cash,
+        close
+    )
+
+    same_data_date = latest_date == old_last_date
+
+    if same_data_date:
+        daily_pl = None
+        cumulative_pl = current_value_before_rebalance - initial_cash
+
+        rows = build_position_rows(
+            holdings=old_holdings,
+            cash=old_cash,
+            close=close,
+            total_value=current_value_before_rebalance,
+            include_daily_pl=False
+        )
+
+        message = format_report(
+            latest_date=latest_date,
+            details=details,
+            action_text="ℹ️ 資料日期沒有更新，同一天重跑，不重複計算 P/L",
+            initial_cash=initial_cash,
+            previous_value=None,
+            current_value=current_value_before_rebalance,
+            daily_pl=None,
+            cumulative_pl=cumulative_pl,
+            max_diff=0.0,
+            rows=rows,
+            include_daily_pl=False,
+            note="今天已經建立 / 更新過，不會重複計算損益。"
+        )
+
+        send_telegram(bot_token, chat_id, message)
+        print("Same date, no update.")
+        return
+
+    # 新交易日：先用舊持倉計算今天損益
+    daily_pl = current_value_before_rebalance - old_last_value
+    cumulative_pl = current_value_before_rebalance - initial_cash
+
+    last_checked_month = state.get("last_checked_month")
+    is_monthly_check = last_checked_month != current_month
+
+    if is_monthly_check:
+        max_diff = max_weight_change(target_weights, old_target_weights)
+    else:
+        max_diff = 0.0
+
+    should_rebalance = is_monthly_check and max_diff >= CHANGE_THRESH
+
+    if should_rebalance:
+        # 用今日收盤價，把目前組合價值換成新策略持倉
+        new_holdings, new_cash = build_positions_from_weights(
+            target_weights,
+            current_value_before_rebalance,
+            close
+        )
+
+        current_value_after_rebalance = portfolio_value(
+            new_holdings,
+            new_cash,
+            close
+        )
+
+        state = {
+            "initial_cash": initial_cash,
+            "start_date": state.get("start_date", latest_date),
+            "last_date": latest_date,
+            "last_value": current_value_after_rebalance,
+            "holdings": new_holdings,
+            "cash": new_cash,
+            "target_weights": target_weights,
+            "last_checked_month": current_month,
+            "last_rebalance_month": current_month,
+            "updated_at_utc": datetime.now(timezone.utc).isoformat()
+        }
+
+        save_state(state)
+
+        rows = build_position_rows(
+            holdings=new_holdings,
+            cash=new_cash,
+            close=close,
+            total_value=current_value_after_rebalance,
+            include_daily_pl=False
+        )
+
+        message = format_report(
+            latest_date=latest_date,
+            details=details,
+            action_text="✅ 觸發換倉，已用今日收盤價建立新虛擬持倉",
+            initial_cash=initial_cash,
+            previous_value=old_last_value,
+            current_value=current_value_after_rebalance,
+            daily_pl=daily_pl,
+            cumulative_pl=cumulative_pl,
+            max_diff=max_diff,
+            rows=rows,
+            include_daily_pl=False,
+            note="今日 P/L 是換倉前舊持倉的結果；新持倉從下一個交易日開始計算 P/L。"
+        )
+
+        send_telegram(bot_token, chat_id, message)
+        print("Rebalanced.")
+        return
+
+    # 不換倉，沿用原本股數
+    state["last_date"] = latest_date
+    state["last_value"] = current_value_before_rebalance
+    state["updated_at_utc"] = datetime.now(timezone.utc).isoformat()
+
+    if is_monthly_check:
+        state["last_checked_month"] = current_month
+        action_text = "⏸️ 本月檢查未達換倉門檻，沿用原持倉"
+        note = "策略本月有檢查，但最大權重變化未達 20%，所以不換倉。"
+    else:
+        action_text = "⏸️ 持續追蹤，不換倉"
+        note = ""
+
+    save_state(state)
+
+    rows = build_position_rows(
+        holdings=old_holdings,
+        cash=old_cash,
         close=close,
-        effective_weights=effective_weights,
+        total_value=current_value_before_rebalance,
+        include_daily_pl=True
+    )
+
+    message = format_report(
+        latest_date=latest_date,
         details=details,
-        total_cash=total_cash,
+        action_text=action_text,
+        initial_cash=initial_cash,
+        previous_value=old_last_value,
+        current_value=current_value_before_rebalance,
+        daily_pl=daily_pl,
+        cumulative_pl=cumulative_pl,
         max_diff=max_diff,
-        action_text=action_text
+        rows=rows,
+        include_daily_pl=True,
+        note=note
     )
 
     send_telegram(bot_token, chat_id, message)
-
-    print("Quant report sent successfully.")
+    print("Daily tracking report sent.")
 
 
 if __name__ == "__main__":
@@ -796,6 +985,7 @@ if __name__ == "__main__":
 1. Alpaca API Key / Secret 錯誤或貼反
 2. GitHub Secrets 沒設定 ALPACA_API_KEY / ALPACA_API_SECRET
 3. requirements.txt 沒有 pandas 或 numpy
+4. Alpaca 當下資料尚未更新
 """
 
         if bot_token and chat_id:
