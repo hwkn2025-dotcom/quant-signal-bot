@@ -10,7 +10,7 @@ import numpy as np
 
 
 # =========================
-# 策略參數
+# 你的策略設定
 # =========================
 
 TECH = [
@@ -118,14 +118,19 @@ def fetch_alpaca_daily_bars(symbols):
     while True:
         if page_token:
             params["page_token"] = page_token
-        elif "page_token" in params:
+        else:
             params.pop("page_token", None)
 
-        response = requests.get(url, headers=headers, params=params, timeout=60)
+        response = requests.get(
+            url,
+            headers=headers,
+            params=params,
+            timeout=60
+        )
 
         if response.status_code == 401:
             raise RuntimeError(
-                "Alpaca 401 授權失敗：ALPACA_API_KEY 或 ALPACA_API_SECRET 錯誤、貼反、過期，或 GitHub Secret 沒更新成功。"
+                "Alpaca 401 授權失敗：請重新確認 ALPACA_API_KEY / ALPACA_API_SECRET 是否正確、有沒有貼反、是否用 Paper Trading API Key。"
             )
 
         if response.status_code != 200:
@@ -169,9 +174,11 @@ def fetch_alpaca_daily_bars(symbols):
         .sort_index()
     )
 
-    for required in ["QQQ", "FNGS"]:
-        if required not in close.columns or close[required].dropna().empty:
-            raise RuntimeError(f"缺少必要資料：{required}")
+    if "QQQ" not in close.columns or close["QQQ"].dropna().empty:
+        raise RuntimeError("缺少必要資料：QQQ")
+
+    if "FNGS" not in close.columns or close["FNGS"].dropna().empty:
+        raise RuntimeError("缺少必要資料：FNGS")
 
     return close
 
@@ -185,7 +192,7 @@ def market_regime(close):
     f = close["FNGS"].dropna()
 
     if len(q) < 200:
-        return "bear", ["QQQ 資料不足 200 日，保守判定 bear"]
+        return "bear", ["QQQ 資料不足 200 日，保守判定熊市"]
 
     q_now = q.iloc[-1]
     q_sma200 = q.iloc[-200:].mean()
@@ -193,32 +200,25 @@ def market_regime(close):
     q_sma100 = q.iloc[-100:].mean()
     q_sma50 = q.iloc[-50:].mean()
 
-    reasons = []
-
     if q_now < q_sma200:
-        reasons.append("QQQ < SMA200")
-        return "bear", reasons
+        return "bear", ["QQQ 低於 200 日均線"]
 
     if len(f) >= 100:
         f_now = f.iloc[-1]
         f_sma100 = f.iloc[-100:].mean()
 
         if q_now < q_sma100 and f_now < f_sma100:
-            reasons.append("QQQ 與 FNGS 皆低於 SMA100")
-            return "bear", reasons
+            return "bear", ["QQQ 與 FNGS 都低於 100 日均線"]
 
     ret21 = q_now / q.iloc[-22] - 1
 
     if q_now < q_sma50 and ret21 < -0.08:
-        reasons.append("QQQ < SMA50 且 21 日跌幅 < -8%")
-        return "bear", reasons
+        return "bear", ["QQQ 低於 50 日均線，且近 21 日跌幅超過 8%"]
 
     if q_now > q_sma150 * 1.03:
-        reasons.append("QQQ > SMA150 × 1.03")
-        return "bull", reasons
+        return "bull", ["QQQ 高於 150 日均線 3% 以上"]
 
-    reasons.append("未達 bull，也未觸發 bear")
-    return "neutral", reasons
+    return "neutral", ["未達牛市條件，也未觸發熊市條件"]
 
 
 # =========================
@@ -258,20 +258,15 @@ def score_candidates(close, candidates):
 
         sma100 = s.iloc[-100:].mean()
         trend = p_now / sma100 - 1
-
         drawdown = p_now / s.iloc[-63:].max() - 1
 
         score = momentum / volatility + trend + drawdown
-
-        vol63 = daily_ret.iloc[-63:].std(ddof=1)
 
         if not np.isfinite(score):
             continue
 
         row = {
             "score": float(score),
-            "volatility": float(volatility),
-            "vol63": float(vol63) if np.isfinite(vol63) else None,
             "price": float(p_now)
         }
 
@@ -338,10 +333,6 @@ def vol63_for(close, ticker):
         return None
 
     r = s.pct_change().dropna()
-
-    if len(r) < 10:
-        return None
-
     v = r.iloc[-63:].std(ddof=1)
 
     if not np.isfinite(v) or v <= 0:
@@ -408,7 +399,7 @@ def volatility_scale(close):
 
 
 # =========================
-# 計算目標配置
+# 計算策略配置
 # =========================
 
 def compute_target_weights(close):
@@ -535,7 +526,7 @@ def max_weight_change(new_weights, old_weights):
 
 
 # =========================
-# 報告
+# 報告工具
 # =========================
 
 def add_cash_if_needed(weights):
@@ -565,7 +556,6 @@ def get_latest_and_prev_price(close, ticker):
 
 def format_report(
     close,
-    target_weights,
     effective_weights,
     details,
     total_cash,
@@ -581,32 +571,7 @@ def format_report(
         if t != "CASH"
     )
 
-    lines = []
-
-    lines.append("📊 策略每日報告")
-    lines.append("")
-    lines.append(f"📅 資料日期：{latest_date}")
-    lines.append(f"📌 市況：{details['regime'].upper()}")
-    lines.append(f"⚙️ 波動縮放 vol_scale：{details['vol_scale']:.2f}")
-    lines.append(f"🔔 換倉判斷：{action_text}")
-    lines.append(f"📏 最大權重差：{fmt_pct(max_diff)} / 門檻 {fmt_pct(CHANGE_THRESH)}")
-    lines.append("")
-    lines.append(f"💰 設定總資金：{fmt_money(total_cash)}")
-    lines.append(f"📦 總曝險：約 {fmt_pct(exposure)}")
-
-    if exposure > 1.0001:
-        lines.append("⚠️ 注意：曝險超過 100%，代表策略有使用約 3% 超額曝險 / 槓桿概念。")
-
-    lines.append("")
-    lines.append("【策略選出】")
-
-    for bucket, selected in details["selected"].items():
-        lines.append(f"{bucket}：{', '.join(selected)}")
-
-    lines.append("")
-    lines.append("【目前應持有配置】")
-    lines.append("格式：標的｜權重｜金額｜估算股數｜今日P/L")
-
+    rows = []
     portfolio_pl = 0.0
 
     sorted_items = sorted(
@@ -619,43 +584,129 @@ def format_report(
         amount = total_cash * weight
 
         if ticker == "CASH":
-            lines.append(
-                f"{ticker}｜{fmt_pct(weight)}｜{fmt_money(amount)}｜-｜$0.00"
-            )
+            rows.append({
+                "ticker": ticker,
+                "weight": weight,
+                "amount": amount,
+                "shares": None,
+                "daily_pl": 0.0,
+                "daily_ret": 0.0,
+                "price": None,
+                "note": "現金"
+            })
             continue
 
         latest_price, prev_price = get_latest_and_prev_price(close, ticker)
 
         if latest_price is None or prev_price is None:
-            lines.append(
-                f"{ticker}｜{fmt_pct(weight)}｜{fmt_money(amount)}｜無價格資料｜無法計算P/L"
-            )
+            rows.append({
+                "ticker": ticker,
+                "weight": weight,
+                "amount": amount,
+                "shares": None,
+                "daily_pl": 0.0,
+                "daily_ret": 0.0,
+                "price": None,
+                "note": "無價格資料"
+            })
             continue
 
         shares = amount / latest_price
         daily_ret = latest_price / prev_price - 1
         daily_pl = amount * daily_ret
+
         portfolio_pl += daily_pl
 
-        sign = "+" if daily_pl >= 0 else ""
-
-        lines.append(
-            f"{ticker}｜{fmt_pct(weight)}｜{fmt_money(amount)}｜{shares:.4f}股｜{sign}{fmt_money(daily_pl)} ({fmt_pct(daily_ret)})"
-        )
+        rows.append({
+            "ticker": ticker,
+            "weight": weight,
+            "amount": amount,
+            "shares": shares,
+            "daily_pl": daily_pl,
+            "daily_ret": daily_ret,
+            "price": latest_price,
+            "note": ""
+        })
 
     portfolio_ret = portfolio_pl / total_cash if total_cash > 0 else 0
     estimated_value = total_cash + portfolio_pl
 
-    lines.append("")
-    lines.append("【投資組合每日變化】")
+    if "初始化" in action_text:
+        trade_status = "✅ 第一次建立配置"
+    elif "觸發換倉" in action_text:
+        trade_status = "✅ 需要換倉"
+    else:
+        trade_status = "⏸️ 不需要換倉"
+
+    regime = details["regime"].upper()
+
+    if regime == "BULL":
+        regime_text = "BULL 牛市"
+    elif regime == "NEUTRAL":
+        regime_text = "NEUTRAL 中性"
+    else:
+        regime_text = "BEAR 熊市"
+
+    reason_text = "、".join(details.get("reasons", []))
 
     sign = "+" if portfolio_pl >= 0 else ""
 
-    lines.append(f"今日總 P/L：{sign}{fmt_money(portfolio_pl)} ({fmt_pct(portfolio_ret)})")
-    lines.append(f"今日估算資金：{fmt_money(estimated_value)}")
+    lines = []
+
+    lines.append(f"📊 策略報告｜{latest_date}")
     lines.append("")
-    lines.append("註：此 P/L 是依照系統目前配置，用最新收盤價估算的每日變化。")
+    lines.append(f"📌 市況：{regime_text}")
+    lines.append(f"🔔 換倉：{trade_status}")
+    lines.append(f"🧠 原因：{reason_text}")
+    lines.append("")
+    lines.append(f"💰 設定總資金：{fmt_money(total_cash)}")
+    lines.append(f"📦 總曝險：{fmt_pct(exposure)}")
+    lines.append(f"📈 今日組合 P/L：{sign}{fmt_money(portfolio_pl)} ({fmt_pct(portfolio_ret)})")
+    lines.append(f"💼 今日估算資金：{fmt_money(estimated_value)}")
+    lines.append("")
+    lines.append(f"⚙️ 波動縮放：{details['vol_scale']:.2f}")
+    lines.append(f"📏 最大權重變化：{fmt_pct(max_diff)}")
+    lines.append("")
+
+    if exposure > 1.0001:
+        lines.append("⚠️ 注意：目前曝險超過 100%，代表策略有使用超額曝險。")
+        lines.append("")
+
+    lines.append("━━━━━━━━━━━━━━")
+    lines.append("📌 應持有配置")
+    lines.append("")
+
+    for idx, row in enumerate(rows, start=1):
+        ticker = row["ticker"]
+        weight = row["weight"]
+        amount = row["amount"]
+        shares = row["shares"]
+        daily_pl = row["daily_pl"]
+        daily_ret = row["daily_ret"]
+        price = row["price"]
+        note = row["note"]
+
+        lines.append(f"{idx}. {ticker}")
+        lines.append(f"比例：{fmt_pct(weight)}")
+        lines.append(f"金額：{fmt_money(amount)}")
+
+        if ticker == "CASH":
+            lines.append("股數：-")
+            lines.append("今日：$0.00")
+        elif shares is None:
+            lines.append("股數：無法計算")
+            lines.append(f"今日：{note}")
+        else:
+            pl_sign = "+" if daily_pl >= 0 else ""
+            lines.append(f"股數：{shares:.4f} 股")
+            lines.append(f"價格：{fmt_money(price)}")
+            lines.append(f"今日：{pl_sign}{fmt_money(daily_pl)} ({fmt_pct(daily_ret)})")
+
+        lines.append("")
+
+    lines.append("━━━━━━━━━━━━━━")
     lines.append("註：本系統只通知，不會自動下單。")
+    lines.append("註：P/L 是依照策略配置與最新收盤價估算。")
 
     return "\n".join(lines)
 
@@ -693,6 +744,7 @@ def main():
 
     if trade_action:
         effective_weights = target_weights
+
         if first_run:
             action_text = "初始化：建立第一份策略配置"
         else:
@@ -716,7 +768,6 @@ def main():
 
     message = format_report(
         close=close,
-        target_weights=target_weights,
         effective_weights=effective_weights,
         details=details,
         total_cash=total_cash,
@@ -741,7 +792,10 @@ if __name__ == "__main__":
 原因：
 {str(e)}
 
-如果是 Alpaca 401，代表 ALPACA_API_KEY / ALPACA_API_SECRET 錯誤、貼反、過期，或 GitHub Secrets 沒更新成功。
+常見原因：
+1. Alpaca API Key / Secret 錯誤或貼反
+2. GitHub Secrets 沒設定 ALPACA_API_KEY / ALPACA_API_SECRET
+3. requirements.txt 沒有 pandas 或 numpy
 """
 
         if bot_token and chat_id:
